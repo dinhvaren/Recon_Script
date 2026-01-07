@@ -7,6 +7,12 @@ The script focuses on **asset discovery and normalization**, producing a clean *
 > No exploitation is performed.  
 > Nuclei scanning is **optional** and only runs when explicitly enabled.
 
+## Recon Workflow
+
+The following diagram illustrates the reconnaissance workflow implemented by this script.
+
+![Recon Workflow](Workflow/Workflow.png)
+
 ## Quick Start
 
 ### Install requirements

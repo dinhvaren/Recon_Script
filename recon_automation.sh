@@ -2,6 +2,11 @@
 set -euo pipefail
 
 TARGET="${1:-}"
+# normalize if user passes URL
+TARGET="${TARGET#http://}"
+TARGET="${TARGET#https://}"
+TARGET="${TARGET%%/*}"
+
 # sanitize target for folder name (avoid / : ? etc.)
 SAFE_TARGET="$(echo "${TARGET:-target}" | sed 's#[^a-zA-Z0-9._-]#_#g')"
 OUTBASE="${2:-recon_${SAFE_TARGET}}"
@@ -109,6 +114,13 @@ if [[ ! -s "$SUBS" ]]; then
   log "Subdomains(passive): $(wc -l < "$SUBS")"
 else
   log "Skip subfinder (exists): $SUBS"
+fi
+
+# ALWAYS include root/apex domain (subfinder may not include it)
+if ! grep -qxF "$TARGET" "$SUBS" 2>/dev/null; then
+  echo "$TARGET" >> "$SUBS"
+  sort -u "$SUBS" -o "$SUBS"
+  log "Added root domain into subdomains list: $TARGET"
 fi
 
 # Optional brute DNS (only if dnsx exists and BRUTE=1)
@@ -496,9 +508,16 @@ cat "$API"    2>/dev/null | sort -u > "$API_TXT"    || : > "$API_TXT"
 log "Vulnerability Scan (optional: NUCLEI=1)"
 
 NUC_DIR="$OUT/vuln"
+mkdir -p "$NUC_DIR"
+
 NUC_OUT_TXT="$NUC_DIR/nuclei_findings.txt"
 NUC_OUT_JSON="$NUC_DIR/nuclei_findings.jsonl"
 NUC_SUMMARY="$NUC_DIR/nuclei_summary.txt"
+
+# ensure files exist even when NUCLEI=0 (avoid summary crash)
+: > "$NUC_OUT_TXT" || true
+: > "$NUC_OUT_JSON" || true
+: > "$NUC_SUMMARY" || true
 
 NUC_RATE="${NUC_RATE:-50}"
 NUC_CONC="${NUC_CONC:-25}"
@@ -576,9 +595,6 @@ if [[ "${NUCLEI:-0}" == "1" ]]; then
     log "Nuclei done. Findings: $(wc -l < "$NUC_OUT_TXT" 2>/dev/null || echo 0)"
   else
     log "NUCLEI=1 but nuclei not found or LIVE empty -> skip nuclei scan"
-    : > "$NUC_OUT_TXT"
-    : > "$NUC_OUT_JSON"
-    : > "$NUC_SUMMARY"
   fi
 else
   log "NUCLEI=0 -> skip nuclei scan"

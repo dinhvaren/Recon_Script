@@ -26,6 +26,13 @@ if [[ -z "${TARGET}" ]]; then
   echo "  NUC_TAGS=            nuclei tags filter (optional, e.g. cve,misconfig)"
   echo "  NUC_EXCLUDE_TAGS=dos,fuzz      nuclei exclude-tags (optional)"
   echo
+  echo "  GOWITNESS=1          Enable gowitness screenshots (requires gowitness)"
+  echo "  GW_TIMEOUT=30        gowitness timeout seconds"
+  echo "  GW_DELAY=5           gowitness delay before screenshot"
+  echo "  GW_THREADS=6         gowitness concurrency"
+  echo "  GW_FULLPAGE=1        full-page screenshots (1=on, 0=off)"
+  echo "  GW_FORMAT=png        screenshot format: png|jpeg"
+  echo
   exit 1
 fi
 
@@ -85,6 +92,7 @@ HAS_AMASS=0; command -v amass >/dev/null 2>&1 && HAS_AMASS=1
 HAS_WHOIS=0; command -v whois >/dev/null 2>&1 && HAS_WHOIS=1
 HAS_DIG=0; command -v dig >/dev/null 2>&1 && HAS_DIG=1
 HAS_NUCLEI=0; command -v nuclei >/dev/null 2>&1 && HAS_NUCLEI=1
+HAS_GOWITNESS=0; command -v gowitness >/dev/null 2>&1 && HAS_GOWITNESS=1
 
 echo "$TARGET" > "$OUT/target.txt"
 
@@ -194,13 +202,63 @@ else
   log "Skip httpx (exists): $LIVE"
 fi
 
+# 01b) Screenshots (gowitness) - optional
+log "Screenshots (optional: GOWITNESS=1)"
+
+GW_DIR="$OUT/attack_surface/screenshots_gowitness"
+GW_SS_DIR="$GW_DIR/screenshots"
+GW_DB="$GW_DIR/gowitness.sqlite3"
+GW_JSONL="$GW_DIR/gowitness.jsonl"
+mkdir -p "$GW_SS_DIR"
+
+GW_TIMEOUT="${GW_TIMEOUT:-30}"
+GW_DELAY="${GW_DELAY:-5}"
+GW_THREADS="${GW_THREADS:-6}"
+GW_FORMAT="${GW_FORMAT:-png}"
+GW_FULLPAGE="${GW_FULLPAGE:-1}"
+
+if [[ "${GOWITNESS:-0}" == "1" ]]; then
+  if [[ $HAS_GOWITNESS -eq 1 && -s "$LIVE" ]]; then
+    log "Run gowitness screenshots -> $GW_SS_DIR"
+
+    GW_ARGS=(
+      scan file -f "$LIVE"
+      --timeout "$GW_TIMEOUT"
+      --delay "$GW_DELAY"
+      --threads "$GW_THREADS"
+      --screenshot-path "$GW_SS_DIR"
+      --screenshot-format "$GW_FORMAT"
+      --write-db
+      --write-db-uri "sqlite://$GW_DB"
+      --write-jsonl
+      --write-jsonl-file "$GW_JSONL"
+    )
+
+    if [[ "$GW_FULLPAGE" == "1" ]]; then
+      GW_ARGS+=(--screenshot-fullpage)
+    fi
+
+    gowitness "${GW_ARGS[@]}" || true
+
+    SS_COUNT="$(find "$GW_SS_DIR" -type f 2>/dev/null | wc -l | tr -d ' ')"
+    log "Gowitness done. Screenshots: ${SS_COUNT}"
+    log "Gowitness DB: $GW_DB"
+    log "Gowitness JSONL: $GW_JSONL"
+  else
+    log "GOWITNESS=1 but gowitness not found or LIVE empty -> skip"
+  fi
+else
+  log "GOWITNESS=0 -> skip gowitness screenshots"
+fi
+
 # hosts.txt (IMPORTANT: host only, no :port)
 HOSTS_TXT="$OUT/attack_surface/hosts.txt"
 if [[ ! -s "$HOSTS_TXT" ]]; then
   log "Build hosts.txt from live URLs"
   sed -E 's#^https?://##' "$LIVE" 2>/dev/null \
-    | cut -d/ -f1 \
+    | awk -F/ '{print $1}' \
     | cut -d: -f1 \
+    | awk 'NF' \
     | sort -u > "$HOSTS_TXT" || true
   [[ -s "$HOSTS_TXT" ]] || : > "$HOSTS_TXT"
   log "Hosts: $(wc -l < "$HOSTS_TXT" 2>/dev/null || echo 0)"
@@ -305,6 +363,7 @@ if [[ ! -s "$PORTS_TXT" ]]; then
   log "Parse nmap -> ports.txt (host:port)"
   awk '
     /^Nmap scan report for /{
+      host_line=$0
       host=$NF
       gsub(/[()]/,"",host)
     }
@@ -317,10 +376,11 @@ if [[ ! -s "$PORTS_TXT" ]]; then
   log "Open ports: $(wc -l < "$PORTS_TXT" 2>/dev/null || echo 0)"
 fi
 
-# Base URL for fuzz
+# Base URL for fuzz (FIX: more robust than grep)
 BASE_URL="$OUT/tmp/base_url.txt"
 if [[ ! -s "$BASE_URL" ]]; then
-  (grep -E '^https://' "$LIVE" 2>/dev/null || true; grep -E '^http://' "$LIVE" 2>/dev/null || true) \
+  awk 'NF{print $1}' "$LIVE" 2>/dev/null \
+    | grep -E '^https?://' \
     | head -n1 > "$BASE_URL" || true
 fi
 
@@ -392,20 +452,26 @@ fi
 
 # Katana crawl (URLs/JS endpoints)
 if [[ ! -s "$KATANA_URLS" ]]; then
+  : > "$KATANA_URLS"
+
   if [[ $HAS_KATANA -eq 1 && -s "$LIVE" ]]; then
     log "Katana crawl (top 50 live URLs)"
     head -n 50 "$LIVE" > "$OUT/tmp/live_50.txt"
 
-    if [[ "${EXTEND:-0}" == "1" ]]; then
-      katana -silent -list "$OUT/tmp/live_50.txt" -jc -kf -d 3 -ps -o "$KATANA_URLS" || true
-    else
-      katana -silent -list "$OUT/tmp/live_50.txt" -jc -kf -d 2 -o "$KATANA_URLS" || true
+    # FIX: more reliable detect for -depth token
+    KATANA_DEPTH_FLAG="-d"
+    if katana -h 2>&1 | grep -Eq '(^|[[:space:]])-depth([[:space:]]|,|$)'; then
+      KATANA_DEPTH_FLAG="-depth"
     fi
 
-    sort -u "$KATANA_URLS" -o "$KATANA_URLS" || true
+    if [[ "${EXTEND:-0}" == "1" ]]; then
+      katana -silent -list "$OUT/tmp/live_50.txt" -jc -kf all "$KATANA_DEPTH_FLAG" 3 -ps -o "$KATANA_URLS" || true
+    else
+      katana -silent -list "$OUT/tmp/live_50.txt" -jc -kf all "$KATANA_DEPTH_FLAG" 2 -o "$KATANA_URLS" || true
+    fi
+
+    [[ -s "$KATANA_URLS" ]] && sort -u "$KATANA_URLS" -o "$KATANA_URLS" || true
     rm -f "$OUT/tmp/live_50.txt" || true
-  else
-    : > "$KATANA_URLS"
   fi
 fi
 
@@ -488,10 +554,10 @@ if [[ ! -s "$JS_PARAMS_HINT" ]]; then
   [[ -s "$JS_PARAMS_HINT" ]] || : > "$JS_PARAMS_HINT"
 fi
 
-# API candidates heuristic
+# API candidates heuristic (expanded)
 if [[ ! -s "$API" ]]; then
   log "API candidates: grep common patterns from urls.txt"
-  grep -Ei '/api/|/graphql|/swagger|openapi|/v[0-9]+/|/rest/|/wp-json/|/v3/api-docs|/swagger-ui' "$URLS_TXT" 2>/dev/null \
+  grep -Ei '/api/|/ajax|/graphql|/swagger|openapi|/v[0-9]+/|/rest/|/wp-json/|/v3/api-docs|/swagger-ui|/checkout|/cart/|/auth|/login|/order|/payment' "$URLS_TXT" 2>/dev/null \
     | sort -u > "$API" || true
   [[ -s "$API" ]] || : > "$API"
   log "API candidates: $(wc -l < "$API" 2>/dev/null || echo 0)"
@@ -604,6 +670,11 @@ fi
 SUMMARY="$OUT/attack_surface/summary.md"
 log "Write summary: $SUMMARY"
 
+GW_SS_COUNT="0"
+if [[ -d "$GW_SS_DIR" ]]; then
+  GW_SS_COUNT="$(find "$GW_SS_DIR" -type f 2>/dev/null | wc -l | tr -d ' ')" || GW_SS_COUNT="0"
+fi
+
 {
   echo "# Recon -> Attack Surface Summary"
   echo
@@ -612,6 +683,7 @@ log "Write summary: $SUMMARY"
   echo "- BRUTE:  ${BRUTE:-0} (dnsx required)"
   echo "- EXTEND: ${EXTEND:-0} (katana heavier crawl)"
   echo "- NUCLEI: ${NUCLEI:-0} (nuclei vuln scan)"
+  echo "- GOWITNESS: ${GOWITNESS:-0} (screenshots)"
   echo
   echo "## Counts"
   echo "- Subdomains: $(wc -l < "$SUBS" 2>/dev/null || echo 0)"
@@ -626,6 +698,7 @@ log "Write summary: $SUMMARY"
   echo "- Params:     $(wc -l < "$PARAMS_TXT" 2>/dev/null || echo 0)"
   echo "- API cand.:  $(wc -l < "$API_TXT" 2>/dev/null || echo 0)"
   echo "- Nuclei findings: $(wc -l < "$NUC_OUT_TXT" 2>/dev/null || echo 0)"
+  echo "- Gowitness screenshots: ${GW_SS_COUNT}"
   echo
   echo "## Files"
   echo "- subdomains.txt:       DNS_Recon/subdomains.txt"
@@ -649,6 +722,9 @@ log "Write summary: $SUMMARY"
   echo "- nuclei_findings.txt:  vuln/nuclei_findings.txt"
   echo "- nuclei_findings.jsonl:vuln/nuclei_findings.jsonl"
   echo "- nuclei_summary.txt:   vuln/nuclei_summary.txt"
+  echo "- gowitness screenshots: attack_surface/screenshots_gowitness/screenshots/"
+  echo "- gowitness db:          attack_surface/screenshots_gowitness/gowitness.sqlite3"
+  echo "- gowitness jsonl:       attack_surface/screenshots_gowitness/gowitness.jsonl"
 } > "$SUMMARY"
 
 log "DONE Attack surface is ready at: $OUT/attack_surface"
